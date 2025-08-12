@@ -826,7 +826,7 @@ void RocksdbFileSystemAdaptor::close_snapshot(const std::string& path) {
         _snapshots[path].count--;
         if (_snapshots[path].count == 0) {
             _snapshots.erase(iter);
-            _mutil_snapshot_cond.decrease_broadcast();
+            _mutil_snapshot_cond.decrease_signal();
             DB_WARNING("region_id: %ld close snapshot path: %s relase", _region_id, path.c_str());
         }
     }

@@ -46,9 +46,9 @@ public:
     }
     virtual ~SelectManagerNode() {
     }
-    virtual bool can_use_arrow_vector() {
+    virtual bool can_use_arrow_vector(RuntimeState* state) {
         for (auto& c : _children) {
-            if (!c->can_use_arrow_vector()) {
+            if (!c->can_use_arrow_vector(state)) {
                 return false;
             }
         }
@@ -58,12 +58,19 @@ public:
     virtual int get_next(RuntimeState* state, RowBatch* batch, bool* eos);
     virtual void close(RuntimeState* state) {
         ExecNode::close(state);
+        if (_pb_node.derive_node().select_manager_node().slot_order_exprs_size() > 0
+            || _steal_slot_order_exprs) {
+            for (auto& expr : _slot_order_exprs) {
+                ExprNode::destroy_tree(expr);
+            }
+        }
         _sorter = nullptr;
         _region_batches.clear();
         _arrow_responses.clear();
         _arrow_schema.reset();
-        _is_dual_scan = false;
         _arrow_io_executor.reset();
+        _arrow_batch_response.clear();
+        _index_collector_cond.reset();
     }
     int init_sort_info(SortNode* sort_node) {
         _slot_order_exprs = sort_node->slot_order_exprs();
@@ -71,11 +78,16 @@ public:
         _is_null_first = sort_node->is_null_first();
         return 0;
     }
+    void steal_slot_order_exprs(SortNode* sort_node) {
+        sort_node->clear_slot_order_exprs();
+        _steal_slot_order_exprs = true;
+    }
     int single_fetcher_store_open(FetcherInfo* fetcher, RuntimeState* state, ExecNode* exec_node);
 
     void multi_fetcher_store_open(FetcherInfo* self_fetcher, FetcherInfo* other_fetcher,
         RuntimeState* state, ExecNode* exec_node);
     int fetcher_store_run(RuntimeState* state, ExecNode* exec_node);
+    int mpp_fetcher_global_index(RuntimeState* state);
     int open_global_index(FetcherInfo* fetcher, RuntimeState* state,
                           ExecNode* exec_node,
                           int64_t global_index_id,
@@ -118,7 +130,43 @@ public:
     bool need_sorter() {
         return _slot_order_exprs.size() > 0;
     }
+    void set_index_collector_cond(std::shared_ptr<IndexCollectorCond> cond) {
+        _index_collector_cond = cond;
+    }
+    std::shared_ptr<IndexCollectorCond> get_index_collector_cond() {
+        return _index_collector_cond;
+    }
 
+    // 以下函数只有mpp模式会涉及
+    virtual int init(const pb::PlanNode& node);
+    virtual void transfer_pb(int64_t region_id, pb::PlanNode* pb_node);
+    bool is_dual_scan() {
+        ExecNode* dual_scan = get_node(pb::DUAL_SCAN_NODE);
+        return (dual_scan != nullptr);
+    }
+    bool is_mysql_scan() {
+        ExecNode* scan = get_node(pb::SCAN_NODE);
+        if (scan == nullptr) {
+            return false;
+        }
+        return static_cast<ScanNode*>(scan)->is_mysql_scan_node();
+    }
+
+    void add_conditions(std::vector<ExprNode*>& conditions) {
+        _conditions.insert(_conditions.end(), conditions.begin(), conditions.end());
+    }
+    std::vector<bool>& is_asc() {
+        return _is_asc;
+    }
+    std::vector<bool>& is_null_first() {
+        return _is_null_first;
+    }
+    std::vector<ExprNode*>& slot_order_exprs() {
+        return _slot_order_exprs;
+    }
+    std::vector<ExprNode*>& conditions() {
+        return _conditions;
+    }
 private:
     //允许fetcher回来后排序
     std::vector<ExprNode*> _slot_order_exprs;
@@ -128,13 +176,20 @@ private:
     std::shared_ptr<Sorter> _sorter;
     SchemaFactory*  _factory = nullptr;
     int32_t         _scan_tuple_id = 0;
-    bool            _is_dual_scan = false;
+    std::vector<ExprNode*> _conditions;
+    bool _steal_slot_order_exprs = false;
 
     // vectorized
     std::vector<std::shared_ptr<pb::StoreRes>> _arrow_responses;
+    std::vector<std::shared_ptr<pb::BatchRegionStoreRes> > _arrow_batch_response;
     std::shared_ptr<arrow::Schema> _arrow_schema;
     std::vector<RegionReturnData>  _region_batches;
     std::shared_ptr<BthreadArrowExecutor> _arrow_io_executor;
+    std::shared_ptr<IndexCollectorCond> _index_collector_cond;
+    arrow::compute::Expression _vectorize_conditions;
+
+    // mpp
+    bool _has_er_child = false;
 };
 
 class FetcherStoreVectorizedReader : public arrow::RecordBatchReader {
@@ -159,11 +214,11 @@ private:
     std::shared_ptr<arrow::Schema> _schema;
     bool _eos = false;
     bool _need_fetcher_store = false;
-    bool _need_check_arrow_schema = false;
     int _record_batch_idx = 0;
     int64_t _row_idx_in_record_batch = 0;
     std::shared_ptr<Chunk> _chunk;
     std::vector<const pb::TupleDescriptor*> _tuples;
+    std::shared_ptr<IndexCollectorCond> _index_cond;
 };
 }
 

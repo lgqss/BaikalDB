@@ -467,18 +467,28 @@ void StateMachine::_print_query_time(SmartSocket client) {
             }
             sql.resize(slow_idx);
             std::string exec_type = "row";
-            if (ctx->get_runtime_state()->execute_type == pb::EXEC_ARROW_ACERO) {
-                if (ctx->get_runtime_state()->vectorlized_parallel_execution) {
+            auto runtime_state = ctx->get_runtime_state();
+            if (runtime_state->execute_type == pb::EXEC_ARROW_ACERO) {
+                if (runtime_state->vectorlized_parallel_execution) {
                     exec_type = "parallel";
                 } else {
                     exec_type = "vec";
+                }
+                if (runtime_state->sign_exec_type == SIGN_EXEC_ARROW_FORCE_NO_INDEX_JOIN) {
+                    exec_type += "|noindexjoin";
+                }
+                if (ctx->use_mpp) {
+                    exec_type += "|mpp";
+                    mpp_time_cost << stat_info->total_time;
+                } else {
+                    vectorize_time_cost << stat_info->total_time;
                 }
             }
             std::string charset_name = pb::Charset_Name(client->charset);
             std::transform(charset_name.begin(), charset_name.end(), charset_name.begin(), ::tolower);
             DB_NOTICE_LONG("common_query: family=[%s] table=[%s] op_type=[%d] cmd=[0x%x] plat=[%s] ip=[%s:%d] fd=[%d] "
                     "cost=[%ld] field_time=[%ld %ld %ld %ld %ld %ld %ld %ld %ld] row=[%ld] scan_row=[%ld] read_size=[%ld] bufsize=[%zu] "
-                    "key=[%d] changeid=[%lu] logid=[%lu] traceid=[%s] family_ip=[%s] cache=[%d,%d] stmt_name=[%s] "
+                    "db_handle=[%ld:%ld] key=[%d] changeid=[%lu] logid=[%lu] traceid=[%s] family_ip=[%s] cache=[%d,%d] stmt_name=[%s] "
                     "user=[%s] charset=[%s] errno=[%d] txn=[%lu:%d] 1pc=[%d] sign=[%lu] region_count=[%d] exec=[%s] sqllen=[%lu] "
                     "sql=[%s] id=[%ld] bkup=[%d] server_addr=[%s:%d]",
                     stat_info->family.c_str(),
@@ -503,6 +513,8 @@ void StateMachine::_print_query_time(SmartSocket client) {
                     stat_info->num_scan_rows,
                     stat_info->read_disk_size,
                     stat_info->send_buf_size,
+                    stat_info->db_handle_rows, 
+                    stat_info->db_handle_bytes,
                     stat_info->partition_key,
                     stat_info->version,
                     stat_info->log_id,
@@ -1228,6 +1240,13 @@ int StateMachine::_get_json_attributes(std::shared_ptr<QueryContext> ctx) {
                     ctx->get_runtime_state()->partition_threshold = partition_threshold;
                 }
             }
+            json_iter = root.FindMember("pre_split_region_cnt");
+            if (json_iter != root.MemberEnd()) {
+                int64_t pre_split_region_cnt = json_iter->value.GetInt64();
+                if (pre_split_region_cnt > 0) {
+                    ctx->get_runtime_state()->pre_split_region_cnt = pre_split_region_cnt;
+                }
+            }
             json_iter = root.FindMember("range_count_limit");
             if (json_iter != root.MemberEnd()) {
                 int64_t range_count_limit = json_iter->value.GetInt64();
@@ -1261,6 +1280,11 @@ int StateMachine::_get_json_attributes(std::shared_ptr<QueryContext> ctx) {
             if (json_iter != root.MemberEnd()) {
                 ctx->watt_stats_version = json_iter->value.GetUint64();
             }
+            json_iter = root.FindMember("mpp_hash_num");
+            if (json_iter != root.MemberEnd()) {
+                ctx->mpp_hash_num = json_iter->value.GetInt();
+                DB_WARNING("mpp_hash_num: %d", ctx->mpp_hash_num);
+            }
             json_iter = root.FindMember("X-B3-TraceId");
             if (json_iter != root.MemberEnd() && json_iter->value.IsString()) {
                 ctx->stat_info.trace_id = json_iter->value.GetString();
@@ -1275,10 +1299,24 @@ int StateMachine::_get_json_attributes(std::shared_ptr<QueryContext> ctx) {
                 ctx->no_binlog = json_iter->value.GetBool();
                 DB_WARNING("no_binlog: %d", ctx->no_binlog);
             }
+            json_iter = root.FindMember("disable_on_update");
+            if (json_iter != root.MemberEnd() && root["disable_on_update"].IsBool()) {
+                ctx->disable_on_update = json_iter->value.GetBool();
+                DB_WARNING("disable_on_update: %d", ctx->disable_on_update);
+            }
+            json_iter = root.FindMember("mpp");
+            if (json_iter != root.MemberEnd() && root["mpp"].IsBool()) {
+                ctx->use_mpp = json_iter->value.GetBool();
+            }
             json_iter = root.FindMember("query_cache");
             if (json_iter != root.MemberEnd()) {
                 ctx->query_cache = json_iter->value.GetInt64();
                 DB_WARNING("query_cache: %ld", ctx->query_cache);
+            }
+            json_iter = root.FindMember("efsearch");
+            if (json_iter != root.MemberEnd()) {
+                ctx->efsearch = json_iter->value.GetInt();
+                DB_WARNING("efsearch: %d", ctx->efsearch);
             }
         } catch (...) {
             DB_WARNING("parse extra file error [%s]", json_str.c_str());
@@ -1737,7 +1775,10 @@ bool StateMachine::_handle_client_query_common_query(SmartSocket client) {
     client->query_ctx->client_conn = client.get();
     client->query_ctx->stat_info.sql_length = client->query_ctx->sql.size();
     client->query_ctx->charset = client->charset;
-
+    client->executing_query = true;
+    ON_SCOPE_EXIT([client]() {
+        client->executing_query = false;
+    });
     // sql planner.
     TimeCost cost;
     TimeCost cost1;
@@ -1747,6 +1788,10 @@ bool StateMachine::_handle_client_query_common_query(SmartSocket client) {
     if (ret < 0) {
         DB_WARNING_CLIENT(client, "Failed to LogicalPlanner::analyze: %s",
             client->query_ctx->sql.c_str());
+        // single SQL transaction need to reset connection transaction status
+        if (client->query_ctx->get_runtime_state()->single_sql_autocommit()) {
+            client->on_commit_rollback();
+        }
         if (client->query_ctx->stat_info.error_code == ER_ERROR_FIRST) {
             client->query_ctx->stat_info.error_code = ER_GEN_PLAN_FAILED;
             client->query_ctx->stat_info.error_msg << "get logical plan failed";
@@ -1820,21 +1865,37 @@ bool StateMachine::_handle_client_query_common_query(SmartSocket client) {
     client->query_ctx->stat_info.query_plan_time = cost.get_time();
     if (client->query_ctx->explain_type == SHOW_PLAN) {
         client->on_commit_rollback();
-        pb::Plan plan;
-        ExecNode::create_pb_plan(0, &plan, client->query_ctx->root);
-        std::string plan_str = "logical_plan:" + client->query_ctx->plan.DebugString() + "\n" +
-                               "physical_plan:" + plan.DebugString();
         std::vector<ResultField> fields;
         ResultField field;
         field.name = "Plan";
         field.type = MYSQL_TYPE_VARCHAR;
         field.length = 1024*1024;
         fields.push_back(field);
-
         std::vector< std::vector<std::string> > rows;
-        std::vector<std::string> row;
-        row.push_back(plan_str);
-        rows.push_back(row);
+        
+        if (!client->query_ctx->use_mpp) {
+            std::vector<std::string> row;
+            ExecNode* root = client->query_ctx->root;
+            pb::Plan plan;
+            ExecNode::create_pb_plan(0, &plan, root);
+            std::string plan_str = "logical_plan:" + client->query_ctx->plan.DebugString() + "\n" +
+                                "physical_plan:" + plan.DebugString() + "\n" ;
+            row.push_back(plan_str);
+            rows.push_back(row);
+        } else {
+            std::vector<std::string> row;
+            for (auto fragment : client->query_ctx->fragments) {
+                row.clear();
+                pb::Plan plan;
+                int fragment_id = fragment.first;
+                ExecNode* fragment_root = fragment.second->root;
+                ExecNode::create_pb_plan(0, &plan, fragment_root);
+                std::string plan_str = "fragment_id: " + std::to_string(fragment_id) + "\n" +
+                    "physical_plan:" + plan.DebugString() + "\n";
+                row.push_back(plan_str);
+                rows.push_back(row);
+            }
+        }
         if (_make_common_resultset_packet(client, fields, rows) != 0) {
             DB_FATAL_CLIENT(client, "Failed to make result packet.");
             _wrapper->make_err_packet(client, ER_MAKE_RESULT_PACKET, "Failed to make result packet.");
