@@ -39,6 +39,9 @@ public:
     int get_int64(const std::string& col, int64_t* val) {
         return 0;
     }
+    int get_string(const std::string& col, std::string* value) {
+        return 0;
+    }
     int get_string(uint32_t column_index, std::string* value) {
         return 0;
     }
